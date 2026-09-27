@@ -91,4 +91,4 @@ For the real data size (about 1.6M S1 and 10M S2/S3 rows) on an 8 GB laptop, use
 
 Measured on synthetic data of the real size (1.6M S1 + 10.4M S2/S3, 4 CPUs): training with
 `TRAIN_FRAC=1.0` took 28 minutes with a 5.1 GB peak, and that was before the pass-2 preallocation
-removed about 1.2 GB. With `TRAIN_FRAC=0.5` the peak is about half.
+removed about 1.2 GB. Prediction on the same full size took 30 minutes with a 4.0 GB peak.
