@@ -364,21 +364,21 @@ class BlockingConfig:
     # ---- retrieval (S2/S3 record -> nearest S1 entities) --------------------
     dim: int = 64                 # SVD dimensions of the dense vector (64 keeps RAM low)
     fit_rows: int = 300_000       # S1 rows used to fit TF-IDF + SVD (a sample keeps RAM low)
-    ann_k: int = 5                # ANN neighbours (S1 entities) retrieved per S2/S3 record
-    pool_k: int = 3               # after exact rescoring keep this many S1 per S2/S3 record
+    ann_k: int = 10               # ANN neighbours (S1 entities) retrieved per S2/S3 record
+    pool_k: int = 4               # after exact rescoring keep this many S1 per S2/S3 record
     hnsw_m: int = 16
     ef_search: int = 64
     exact_below: int = 20_000     # exact (flat) search when a country block is smaller than this
     key_bucket_cap: int = 20      # ignore exact-key buckets with more S1 records than this
     name_weight: float = 0.8      # sim_comb = w^2 * name_cos + (1 - w^2) * addr_cos
     # ---- selection (final candidate set) --------------------------------------
-    k_left: int = 2               # keep top-k S2/S3 records per S1 entity
-    k_right: int = 1              # keep top-k S1 entities per S2/S3 record
-    k_name: int = 0               # keep top-k per S1 entity by name similarity only
+    k_left: int = 3               # keep top-k S2/S3 records per S1 entity
+    k_right: int = 2              # keep top-k S1 entities per S2/S3 record
+    k_name: int = 1               # keep top-k per S1 entity by name similarity only
     keep_exact_name: int = 0      # always keep exact core-name hits
-    min_sim: float = 0.30         # absolute floor on combined similarity ...
-    min_name_sim: float = 0.55    # ... unless the name alone is this similar
-    max_per_s1: int = 5           # hard cap per S1 entity
+    min_sim: float = 0.25         # absolute floor on combined similarity ...
+    min_name_sim: float = 0.50    # ... unless the name alone is this similar
+    max_per_s1: int = 8           # hard cap per S1 entity
 
     def to_dict(self):
         return asdict(self)
@@ -675,6 +675,30 @@ def _num_feats(nl, nr):
     return jac, first
 
 
+def _token_jw(a, b):
+    """Monge-Elkan: for each word of the shorter string, best Jaro-Winkler against the other string's
+    words, averaged. Robust to typos AND word reordering."""
+    out = np.zeros(len(a), np.float32)
+    jw = JaroWinkler.normalized_similarity
+    for i, (x, y) in enumerate(zip(a, b)):
+        xs, ys = x.split(), y.split()
+        if not xs or not ys:
+            continue
+        if len(xs) > len(ys):
+            xs, ys = ys, xs
+        out[i] = sum(max(jw(t, u) for u in ys) for t in xs) / len(xs)
+    return out
+
+
+def _common_prefix(x, y):
+    n = 0
+    for c1, c2 in zip(x, y):
+        if c1 != c2:
+            break
+        n += 1
+    return n
+
+
 def _name_nums(names):
     return ["".join(sorted(t for t in n.split() if t.isdigit())) for n in names]
 
@@ -718,6 +742,9 @@ def pair_features(cand, s1, s1idx, rdf, r_local, rvec):
     F["n_acronym"] = np.array([(len(a) >= 2 and a == y) or (len(b) >= 2 and b == x)
                                for a, b, x, y in zip(la_, ra_, lnc, rnc)], np.int8)
     F["n_num_eq"] = _tristate(_name_nums(ln), _name_nums(rn))
+    F["n_tok_jw"] = _token_jw(ln, rn)                                  # typo-tolerant word matching
+    F["n_contain"] = np.array([bool(x) and bool(y) and (x in y or y in x) for x, y in zip(lnc, rnc)], np.int8)
+    F["n_prefix"] = np.array([_common_prefix(x, y) for x, y in zip(lnc, rnc)], np.float32)
     ltok = np.array([len(x.split()) for x in ln], np.float32)
     rtok = np.array([len(x.split()) for x in rn], np.float32)
     F["n_len_l"], F["n_len_r"], F["n_len_diff"] = ltok, rtok, np.abs(ltok - rtok)
@@ -735,6 +762,10 @@ def pair_features(cand, s1, s1idx, rdf, r_local, rvec):
     F["a_region"] = _tristate([x[3] for x in pl], [x[3] for x in pr])
     jac, first = _num_feats([x[0] for x in pl], [x[0] for x in pr])
     F["a_num_jacc"], F["a_num_first"] = jac, first
+    # S1 house number found anywhere in the other address (handles reordered components)
+    F["a_house_in"] = np.array([(-1 if not x[0] or not y[0] else int(x[0][0] in y[0]))
+                                for x, y in zip(pl, pr)], np.int8)
+    F["a_tok_jw"] = _token_jw(la, ra)
     al = np.array([len(x.split()) for x in la], np.float32)
     ar = np.array([len(x.split()) for x in ra], np.float32)
     F["a_len_ratio"] = np.minimum(al, ar) / np.maximum(np.maximum(al, ar), 1)
@@ -814,9 +845,31 @@ def run_blocking(data_dir, split, cfg, s1, keep_right=None):
 
 
 # %% [METRIC + MODEL + DECISION RULE]
-LGB_PARAMS = dict(objective="binary", learning_rate=0.05, num_leaves=63, min_child_samples=20,
-                  feature_fraction=0.8, bagging_fraction=0.8, bagging_freq=1, lambda_l2=1.0,
+LGB_PARAMS = dict(objective="binary", learning_rate=0.05, num_leaves=127, min_child_samples=40,
+                  feature_fraction=0.7, bagging_fraction=0.8, bagging_freq=1, lambda_l2=2.0,
                   max_bin=127, verbose=-1, seed=42)
+STAGE2_ROUNDS = 300
+
+
+def stage2_features(X, li, ri, p):
+    """Stage 2 ("collective") features: how does this pair's stage-1 probability compare with the
+    other candidates of the same S1 entity and of the same S2/S3 record? Lets the model learn e.g.
+    "an S2 record already has a much better S1" or "this S1 has several strong candidates".
+    Added in place to X."""
+    p = np.asarray(p, np.float32)
+    ps = pd.Series(p)
+    for side, g in (("l", li), ("r", ri)):
+        grp = ps.groupby(g)
+        mx = grp.transform("max").values
+        X[f"p_gap_{side}"] = mx - p
+        X[f"p_rank_{side}"] = grp.rank(ascending=False, method="min").values.astype(np.float32)
+        X[f"p_sum_{side}"] = grp.transform("sum").values - p
+        X[f"p_n50_{side}"] = pd.Series(p >= 0.5).groupby(g).transform("sum").values.astype(np.float32)
+        # best probability among the OTHER candidates of this group
+        second = pd.Series(np.where(p >= mx, -1.0, p)).groupby(g).transform("max").values
+        X[f"p_other_{side}"] = np.where(p >= mx, np.maximum(second, 0), mx).astype(np.float32)
+    X["p1"] = p
+    return X
 
 
 def per_entity_f05(li, keep, label, n_true, beta=0.5):
@@ -915,23 +968,94 @@ def train(cfg=None, frac=TRAIN_FRAC):
     remap[ent_mask] = np.arange(ent_mask.sum())
     print(f"model data: {len(ym):,} pairs from {ent_mask.sum():,} S1 entities {mem()}")
 
-    oof = oof_predict(Xm, ym, lim, N_FOLDS, ROUNDS)
-    score, dec = tune_decision(remap[lim], rim, oof, ym, n_true[ent_mask])
-    print(f"OOF macro F0.5 = {score:.4f} with {dec}")
-    f_ent = per_entity_f05(remap[lim], decide(lim, rim, oof, **dec), ym, n_true[ent_mask])
+    print("stage 1 (pairwise model) ...")
+    oof1 = oof_predict(Xm, ym, lim, N_FOLDS, ROUNDS)
+    s1_score, s1_dec = tune_decision(remap[lim], rim, oof1, ym, n_true[ent_mask])
+    print(f"stage 1 OOF macro F0.5 = {s1_score:.4f}")
+    print("stage 2 (collective model on top of stage-1 probabilities) ...")
+    stage2_features(Xm, lim, rim, oof1)
+    oof2 = oof_predict(Xm, ym, lim, N_FOLDS, STAGE2_ROUNDS)
+    s2_score, s2_dec = tune_decision(remap[lim], rim, oof2, ym, n_true[ent_mask])
+    print(f"stage 2 OOF macro F0.5 = {s2_score:.4f}")
+    use_stage2 = s2_score > s1_score          # keep stage 2 only if it actually helps
+    score, dec, oof = (s2_score, s2_dec, oof2) if use_stage2 else (s1_score, s1_dec, oof1)
+    print(f"using stage {2 if use_stage2 else 1}: OOF macro F0.5 = {score:.4f} with {dec}")
+    keep = decide(lim, rim, oof, **dec)
+    f_ent = per_entity_f05(remap[lim], keep, ym, n_true[ent_mask])
+    globals()["LAST_TRAIN"] = dict(s1=s1, li=lim, rid=rid[m], y=ym, p=oof, keep=keep,
+                                   n_true=n_true, f_oracle=f_oracle, score=score)
     country = s1["country_n"].to_numpy(dtype=object)[ent_mask]
     for c in sorted(set(country)):
         print(f"  country={c or '<empty>'}: {f_ent[country == c].mean():.4f} ({(country == c).sum():,} S1)")
 
-    print("fitting final model ...")
-    booster = lgb.train(LGB_PARAMS, lgb.Dataset(Xm, label=ym), num_boost_round=ROUNDS)
-    booster.save_model(os.path.join(ARTIFACTS, "model.txt"))
-    imp = pd.Series(booster.feature_importance("gain"), index=X.columns).sort_values(ascending=False)
+    print("fitting final models ...")
+    base_cols = list(X.columns)
+    b1 = lgb.train(LGB_PARAMS, lgb.Dataset(Xm[base_cols], label=ym), num_boost_round=ROUNDS)
+    b1.save_model(os.path.join(ARTIFACTS, "model.txt"))
+    final = b1
+    if use_stage2:
+        final = lgb.train(LGB_PARAMS, lgb.Dataset(Xm, label=ym), num_boost_round=STAGE2_ROUNDS)
+        final.save_model(os.path.join(ARTIFACTS, "model_stage2.txt"))
+    imp = pd.Series(final.feature_importance("gain"), index=final.feature_name()).sort_values(ascending=False)
     print("top features:\n" + imp.head(12).round(0).to_string())
     with open(os.path.join(ARTIFACTS, "config.json"), "w") as f:
-        json.dump({"blocking": cfg.to_dict(), "decision": dec, "features": list(X.columns),
+        json.dump({"blocking": cfg.to_dict(), "decision": dec, "features": base_cols,
+                   "features_stage2": list(Xm.columns), "use_stage2": bool(use_stage2),
                    "oof_macro_f05": score}, f, indent=2)
     print(f"saved to {ARTIFACTS}  (total {time.time() - t0:.0f}s) {mem()}")
+
+
+# %% [DIAGNOSE: WHERE ARE THE POINTS LOST?]
+def diagnose(n_examples=15):
+    """Run after train(). Splits the gap to 1.0 into blocking misses vs model errors, and prints
+    example mistakes (with the cleaned name/address) so you can see what the model gets wrong."""
+    d = globals().get("LAST_TRAIN")
+    if d is None:
+        print("run train() first")
+        return
+    li, y, keep, p = d["li"], d["y"], d["keep"], d["p"]
+    uniq = np.unique(li)
+    remap = {v: i for i, v in enumerate(uniq)}
+    lr = np.array([remap[v] for v in li])
+    n_true = d["n_true"][uniq]
+    f = per_entity_f05(lr, keep, y, n_true)
+    tp = np.bincount(lr, weights=(keep & (y == 1)), minlength=len(uniq))
+    fp = np.bincount(lr, weights=(keep & (y == 0)), minlength=len(uniq))
+    found = np.bincount(lr, weights=(y == 1), minlength=len(uniq))
+    print(f"macro F0.5 = {f.mean():.4f}   blocking ceiling (oracle) = {d['f_oracle']:.4f}")
+    lost = 1 - f
+    cat = np.full(len(uniq), "", dtype=object)       # first matching reason wins
+    rules = [
+        ("singleton wrongly matched (false merge)", (n_true == 0) & (fp > 0)),
+        ("matched a WRONG record (false merge)", (n_true > 0) & (fp > 0)),
+        ("true match not in candidates (blocking miss)", (n_true > 0) & (found < n_true)),
+        ("true match in candidates but not predicted (model too strict)", (n_true > 0) & (tp < found)),
+    ]
+    print(f"\nwhere the lost points go ({len(uniq):,} S1 entities; numbers add up to 1 - F0.5):")
+    for name, mask in rules:
+        mask = mask & (cat == "") & (lost > 0)
+        cat[mask] = name
+        print(f"  {name:<64} {mask.sum():>8,} entities   -{lost[mask].sum() / len(uniq):.4f}")
+
+    s1, rid = d["s1"], d["rid"]
+    rng = np.random.default_rng(0)
+    fm = np.where(keep & (y == 0))[0]
+    mm = np.where(~keep & (y == 1))[0]
+    fm = rng.choice(fm, size=min(n_examples, len(fm)), replace=False)
+    mm = rng.choice(mm, size=min(n_examples, len(mm)), replace=False)
+    want = set(rid[fm]) | set(rid[mm])
+    rtext = {}
+    for path in sorted(glob.glob(os.path.join(WORK_DIR, "train", "train_chunk_*.pkl"))):
+        ch = pd.read_pickle(path)
+        ch = ch[ch["entity_id"].isin(want)]
+        rtext.update(zip(ch["entity_id"], zip(ch["name_core"], ch["addr"])))
+    for title, idx in (("FALSE MERGES (predicted match, actually different)", fm),
+                       ("MISSED MATCHES (true match was a candidate, not predicted)", mm)):
+        print(f"\n{title}:")
+        for i in idx:
+            r = s1.iloc[li[i]]
+            rn, ra = rtext.get(rid[i], ("?", "?"))
+            print(f"  p={p[i]:.2f}\n     S1: {r['name_core']!r} | {r['addr']!r}\n     {rid[i][:2]}: {rn!r} | {ra!r}")
 
 
 # %% [PREDICT + VALIDATE]
@@ -974,13 +1098,17 @@ def predict(split="test"):
     with open(os.path.join(ARTIFACTS, "config.json")) as f:
         conf = json.load(f)
     cfg = BlockingConfig(**conf["blocking"])
-    booster = lgb.Booster(model_file=os.path.join(ARTIFACTS, "model.txt"))
+    b1 = lgb.Booster(model_file=os.path.join(ARTIFACTS, "model.txt"))
     s1 = load_s1(DATA_DIR, split)
     print(f"{split}: {len(s1):,} S1 entities {mem()}")
     cand, X, rid = run_blocking(DATA_DIR, split, cfg, s1)
     li, ri = cand["li"].values.astype(np.int64), cand["ri"].values.astype(np.int64)
     assert list(X.columns) == conf["features"], "feature mismatch between train and predict"
-    p = booster.predict(X)
+    p = b1.predict(X)
+    if conf.get("use_stage2"):
+        b2 = lgb.Booster(model_file=os.path.join(ARTIFACTS, "model_stage2.txt"))
+        stage2_features(X, li, ri, p)
+        p = b2.predict(X[conf["features_stage2"]])
     del X
     gc.collect()
     keep = decide(li, ri, p, **conf["decision"])
