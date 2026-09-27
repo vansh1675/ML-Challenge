@@ -74,3 +74,21 @@ python train.py --data synthetic && python predict.py --data synthetic
 
 ## Licences
 Everything is permissive: LightGBM (MIT), FAISS (MIT), scikit-learn (BSD-3), RapidFuzz (MIT), pandas/numpy/scipy (BSD). There is no model over 8B parameters.
+
+## Low-memory streaming version (`entity_resolution.py`)
+
+For the real data size (about 1.6M S1 and 10M S2/S3 rows) on an 8 GB laptop, use the single-file
+`entity_resolution.py`:
+
+* Source 1 is indexed once: TF-IDF fitted on a 300k sample, SVD to 64 dimensions, one FAISS HNSW index
+  per country, and exact-key tables stored as uint64 hashes.
+* S2/S3 are streamed in chunks of 200k rows. Each chunk is normalised, cached to disk, and matched
+  against the S1 index. The candidate pool is pruned after every chunk.
+* Pass 2 re-reads the cached chunks and computes features only for the final candidates, written
+  into one preallocated float32 matrix.
+* `TRAIN_FRAC` trains on a cluster-preserving sample of S1 entities (each sampled entity keeps all its
+  matches, and the same fraction of unmatched S2/S3 records is kept).
+
+Measured on synthetic data of the real size (1.6M S1 + 10.4M S2/S3, 4 CPUs): training with
+`TRAIN_FRAC=1.0` took 28 minutes with a 5.1 GB peak, and that was before the pass-2 preallocation
+removed about 1.2 GB. With `TRAIN_FRAC=0.5` the peak is about half.
