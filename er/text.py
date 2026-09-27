@@ -135,9 +135,42 @@ ADDR_CANON = {
     "allee": "all", "rue": "rue", "r": "rue",
     "mount": "mt", "mt": "mt", "fort": "ft", "ft": "ft",
     "saint": "st", "sainte": "st",
-    "cedex": "", "no": "", "number": "", "num": "",
+    "office": "off", "off": "off", "shop": "shop", "plot": "plot", "gala": "shop",
+    "cedex": "", "no": "", "number": "", "num": "", "nos": "",
 }
-ADDR_STOP = {"", "the", "and", "of", "de", "du", "des", "la", "le", "les", "d", "l"}
+ADDR_STOP = {"", "the", "and", "of"}  # keep "de"/"la" (= Delaware / Louisiana codes)
+
+# Multi-word regions -> short codes (applied on the cleaned string before tokenising).
+REGION_PHRASES = {
+    # US states
+    "alabama": "al", "alaska": "ak", "arizona": "az", "arkansas": "ar", "california": "ca", "colorado": "co",
+    "connecticut": "ct", "delaware": "de", "florida": "fl", "georgia": "ga", "hawaii": "hi", "idaho": "id",
+    "illinois": "il", "indiana": "in", "iowa": "ia", "kansas": "ks", "kentucky": "ky", "louisiana": "la",
+    "maine": "me", "maryland": "md", "massachusetts": "ma", "michigan": "mi", "minnesota": "mn",
+    "mississippi": "ms", "missouri": "mo", "montana": "mt", "nebraska": "ne", "nevada": "nv",
+    "new hampshire": "nh", "new jersey": "nj", "new mexico": "nm", "new york": "ny", "north carolina": "nc",
+    "north dakota": "nd", "ohio": "oh", "oklahoma": "ok", "oregon": "or", "pennsylvania": "pa",
+    "rhode island": "ri", "south carolina": "sc", "south dakota": "sd", "tennessee": "tn", "texas": "tx",
+    "utah": "ut", "vermont": "vt", "virginia": "va", "washington": "wa", "west virginia": "wv",
+    "wisconsin": "wi", "wyoming": "wy", "district of columbia": "dc",
+    # Indian states / UTs
+    "andhra pradesh": "ap", "arunachal pradesh": "arp", "assam": "as", "bihar": "br", "chhattisgarh": "cg",
+    "chattisgarh": "cg", "goa": "goa", "gujarat": "gj", "haryana": "hr", "himachal pradesh": "hp",
+    "jharkhand": "jh", "karnataka": "ka", "kerala": "kl", "madhya pradesh": "mp", "maharashtra": "mh",
+    "manipur": "mn", "meghalaya": "ml", "mizoram": "mz", "nagaland": "nl", "odisha": "od", "orissa": "od",
+    "punjab": "pb", "rajasthan": "rj", "sikkim": "sk", "tamil nadu": "tn", "tamilnadu": "tn",
+    "telangana": "tg", "tripura": "tr", "uttar pradesh": "up", "uttarakhand": "uk", "uttaranchal": "uk",
+    "west bengal": "wb", "delhi": "delhi", "new delhi": "delhi", "jammu and kashmir": "jk", "chandigarh": "chd",
+    "puducherry": "py", "pondicherry": "py",
+    # Indian city renames / transliterations
+    "calcutta": "kolkata", "bombay": "mumbai", "madras": "chennai", "bangalore": "bengaluru",
+    "bengalooru": "bengaluru", "poona": "pune", "gurgaon": "gurugram", "baroda": "vadodara",
+    "trivandrum": "thiruvananthapuram", "cochin": "kochi", "mysore": "mysuru", "benares": "varanasi",
+    "banaras": "varanasi", "allahabad": "prayagraj", "simla": "shimla", "calicut": "kozhikode",
+    "vizag": "visakhapatnam", "mangalore": "mangaluru", "belgaum": "belagavi", "hubli": "hubballi",
+    "cawnpore": "kanpur", "secunderabad": "hyderabad", "navi mumbai": "navimumbai",
+}
+_REGION_RE = re.compile(r"\b(" + "|".join(sorted(map(re.escape, REGION_PHRASES), key=len, reverse=True)) + r")\b")
 
 ORDINAL_WORDS = {
     "first": "1", "second": "2", "third": "3", "fourth": "4", "fifth": "5",
@@ -146,9 +179,9 @@ ORDINAL_WORDS = {
 
 
 def norm_address(raw):
-    """Return (normalised address string, tuple of number tokens, postal code or '')."""
+    """Return (normalised address, number tokens, postal code or '', street key, region)."""
     if raw is None or (isinstance(raw, float) and raw != raw):
-        return "", (), ""
+        return "", (), "", "", ""
     s = strip_accents(str(raw)).lower()
     s = re.sub(r"\b(\d{3})\s(\d{3})\b", r"\1\2", s)       # indian PIN "560 001"
     s = re.sub(r"\b(\d{2})\s(\d{3})\b", r"\1\2", s)       # french CP "75 008"
@@ -156,6 +189,7 @@ def norm_address(raw):
     s = re.sub(r"(\d)([a-z])", r"\1 \2", s)
     s = re.sub(r"([a-z])(\d)", r"\1 \2", s)
     s = re.sub(r"[^a-z0-9]+", " ", s)
+    s = _REGION_RE.sub(lambda m: REGION_PHRASES[m.group(1)], s)
     toks = []
     for t in s.split():
         t = ORDINAL_WORDS.get(t, t)
@@ -168,7 +202,15 @@ def norm_address(raw):
         if len(t) in (5, 6):
             postal = t
             break
-    return " ".join(toks), nums, postal
+    # "house number + first street word" e.g. "720 lowell", robust to component reordering
+    street = ""
+    for a, b in zip(toks, toks[1:]):
+        if a.isdigit() and a != postal and not b.isdigit() and len(b) > 1:
+            street = f"{a} {b}"
+            break
+    alpha = [t for t in toks if not t.isdigit()]
+    region = alpha[-1] if alpha else ""   # usually state code / city (last component)
+    return " ".join(toks), nums, postal, street, region
 
 
 def norm_country(raw) -> str:

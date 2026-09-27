@@ -28,6 +28,8 @@ def prepare(df: pd.DataFrame) -> pd.DataFrame:
     df["addr"] = addrs.map(lambda x: x[0])
     df["addr_nums"] = addrs.map(lambda x: x[1])
     df["postal"] = addrs.map(lambda x: x[2])
+    df["street_key"] = addrs.map(lambda x: x[3])
+    df["region"] = addrs.map(lambda x: x[4])
     df["country_n"] = df["country"].map(norm_country)
     df["source"] = df["entity_id"].str.slice(0, 2)
     return df.reset_index(drop=True)

@@ -4,14 +4,18 @@ import time
 import numpy as np
 import pandas as pd
 
-from .blocking import BlockingConfig, Vectors, generate_candidates
+from .blocking import BlockingConfig, Vectors, candidate_pool, select
 from .features import build_features
 
 
 def block_and_featurize(left, right, cfg: BlockingConfig):
     t0 = time.time()
     vecs = Vectors(left, right, cfg)
-    cand = generate_candidates(left, right, vecs, cfg)
+    print(f"vectors: {time.time() - t0:.1f}s")
+    pool = candidate_pool(left, right, vecs, cfg)
+    print(f"retrieval pool: {len(pool):,} pairs ({len(pool) / max(len(left), 1):.2f} per S1) "
+          f"in {time.time() - t0:.1f}s")
+    cand = select(pool, cfg)
     t1 = time.time()
     print(f"blocking: {len(cand):,} candidate pairs for {len(left):,} S1 x {len(right):,} S2/S3 "
           f"({len(cand) / max(len(left), 1):.2f} per S1) in {t1 - t0:.1f}s")
@@ -34,5 +38,5 @@ def to_sets(left, right, li, ri, mask=None):
 
 
 def write_id_lists(sets: dict, order, col: str, path: str):
-    rows = [(i, ",".join(sorted(sets.get(i, set())))) for i in order]
+    rows = [(i, ",".join(sorted(sets.get(i, set())))) for i in dict.fromkeys(order)]  # one row per S1 id
     pd.DataFrame(rows, columns=["source1_entity_id", col]).to_csv(path, sep="\t", index=False)

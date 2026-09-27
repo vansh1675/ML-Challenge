@@ -54,20 +54,28 @@ def _name_nums(names):
     return ["".join(sorted(t for t in n.split() if t.isdigit())) for n in names]
 
 
-def build_features(cand: pd.DataFrame, left: pd.DataFrame, right: pd.DataFrame, vecs) -> pd.DataFrame:
+def build_features(cand: pd.DataFrame, left: pd.DataFrame, right: pd.DataFrame, vecs,
+                   chunk: int = 1_000_000) -> pd.DataFrame:
+    """Chunked so millions of pairs fit in memory; competition features need the full set."""
+    parts = [_pair_features(cand.iloc[s:s + chunk], left, right, vecs) for s in range(0, len(cand), chunk)]
+    F = pd.concat(parts, ignore_index=True) if parts else _pair_features(cand, left, right, vecs)
+    return _competition_features(F, cand["li"].values, cand["ri"].values).astype(np.float32)
+
+
+def _pair_features(cand, left, right, vecs) -> pd.DataFrame:
     li, ri = cand["li"].values, cand["ri"].values
     L, R = left.iloc[li], right.iloc[ri]
     ln, rn = L["name_core"].tolist(), R["name_core"].tolist()
     lf, rf = L["name_full"].tolist(), R["name_full"].tolist()
     la, ra = L["addr"].tolist(), R["addr"].tolist()
 
-    F = pd.DataFrame(index=cand.index)
+    F = pd.DataFrame(index=np.arange(len(cand)))
     # --- blocking similarities ------------------------------------------------
     F["sim_comb"] = cand["sim_comb"].values
     F["sim_name"] = cand["sim_name"].values
+    F["exact_name"] = cand["exact_name"].values
     F["cos_name_word"] = vecs.pair_cosine("name_word", li, ri)
     F["cos_addr_word"] = vecs.pair_cosine("addr_word", li, ri)
-    F["cos_addr_char"] = vecs.pair_cosine("addr_char", li, ri)
 
     # --- name string similarity -----------------------------------------------
     F["n_ratio"] = _cp(ln, rn, fuzz.ratio)
@@ -106,6 +114,8 @@ def build_features(cand: pd.DataFrame, left: pd.DataFrame, right: pd.DataFrame, 
     F["a_jacc"] = _tok_jaccard(la, ra)
     F["a_empty"] = ((L["addr"].values == "").astype(np.int8) + (R["addr"].values == "").astype(np.int8))
     F["a_postal"] = _tristate(L["postal"].values, R["postal"].values)
+    F["a_street"] = _tristate(L["street_key"].values, R["street_key"].values)
+    F["a_region"] = _tristate(L["region"].values, R["region"].values)
     jac, first = _num_feats(L["addr_nums"].tolist(), R["addr_nums"].tolist())
     F["a_num_jacc"] = jac
     F["a_num_first"] = first
@@ -117,9 +127,11 @@ def build_features(cand: pd.DataFrame, left: pd.DataFrame, right: pd.DataFrame, 
     F["country_eq"] = _tristate(L["country_n"].values, R["country_n"].values)
     F["is_s3"] = (R["source"].values == "S3").astype(np.int8)
 
-    # --- relative / competition features (how does this pair rank among rivals?) --
-    g_l = cand["li"].values
-    g_r = cand["ri"].values
+    return F
+
+
+def _competition_features(F, g_l, g_r):
+    """How does this pair compare with the rival candidates of the same S1 / same S2-S3 record?"""
     for col in ["sim_comb", "sim_name", "n_tset", "a_tset"]:
         v = pd.Series(F[col].values)
         F[f"{col}_gap_l"] = (v.groupby(g_l).transform("max") - v).values
@@ -128,4 +140,4 @@ def build_features(cand: pd.DataFrame, left: pd.DataFrame, right: pd.DataFrame, 
     F["rank_r"] = pd.Series(F["sim_comb"].values).groupby(g_r).rank(ascending=False, method="min").values
     F["ncand_l"] = pd.Series(g_l).map(pd.Series(g_l).value_counts()).values
     F["ncand_r"] = pd.Series(g_r).map(pd.Series(g_r).value_counts()).values
-    return F.astype(np.float32)
+    return F

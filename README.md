@@ -5,29 +5,47 @@ Links every Source 1 entity to its matching Source 2 and Source 3 records. Score
 ## Pipeline
 
 ```
-S1, S2, S3 ──► normalise ──► BLOCKING (TF-IDF kNN, both directions, per country)
-                                   │   → candidate_pairs.tsv (exactly what the model scores)
-                                   ▼
-                             ~47 pairwise features (fuzzy name/address, postal, numbers, rank/gap)
-                                   ▼
-                             LightGBM (MIT)  → p(match)
-                                   ▼
-            decision rule tuned on out-of-fold macro F0.5:
-            p ≥ t  AND  each S2/S3 record goes only to its best S1  (AND p ≥ rel·best-of-S1)
-                                   ▼
-                             matching_results.tsv
+S1, S2, S3 ──► normalise (names, addresses, states, city renames)
+                 │
+                 ▼
+  RETRIEVAL pool (wide, cheap):  FAISS HNSW on SVD(TF-IDF name char-3grams + address words)
+                                 per country, S1→S2/S3 and S2/S3→S1
+                               + exact-key hash joins (core name, sorted name tokens, house#+street)
+                 ▼
+  SELECTION (exact cosine):      top-k per S1, top-k per S2/S3 record, similarity floors, per-S1 cap
+                 │   → candidate_pairs.tsv  (exactly the pairs the model scores; ~1.8–2.7 per S1)
+                 ▼
+  ~49 pairwise features → LightGBM (MIT) → p(match)
+                 ▼
+  decision rule tuned on out-of-fold macro F0.5:
+  p ≥ t,  each S2/S3 record goes only to its best S1,  p ≥ rel·(best p of that S1)
+                 ▼
+  matching_results.tsv
 ```
 
-1. **Normalisation** (`er/text.py`): strip accents, map `&` to `and`, and collapse abbreviations to one canonical form (Corp/Corporation, Pvt/Private, St/Street, Bd/Boulevard, ordinals…). A *core name* drops legal suffixes (Inc, LLC, Pvt Ltd, SARL, SAS…). DBA/aka aliases are split out. Postal codes (US 5 digits, India 6 digits even when written "560 001", France 5 digits) and house numbers are extracted. There are no country-specific branches, so France works unchanged.
-2. **Blocking** (`er/blocking.py`): each record becomes an L2-normalised sparse vector: char 2–4-grams of the core name plus address word tokens. Within each country block, exact kNN runs in three passes:
-   * S1 → S2/S3, top `k_left`
-   * S2/S3 → S1, top `k_right`. Source 1 is deduplicated, so each S2/S3 record belongs to at most one S1. Asking "which S1 is nearest to me?" catches S1s that have many duplicates while keeping lists short.
-   * S1 → S2/S3 on the name alone, top `k_name` (catches missing or landmark-only addresses).
+1. **Normalisation** (`er/text.py`):
+   * strips accents; maps `&` to `and`; handles `L.L.C.`/`P.C.` and possessives
+   * collapses abbreviation variants (Corp/Corporation, Pvt/Private, Rd/Road, Bd/Boulevard, Nagar/Ngr, 1st/1…)
+   * maps US and Indian state names to codes (Texas→tx, Uttar Pradesh→up, West Bengal→wb)
+   * maps old city names to current ones (Calcutta→kolkata, Bombay→mumbai, Bangalore→bengaluru…)
+   * builds a *core name* without legal suffixes (LLC, Pvt Ltd, SARL…)
+   * extracts the postal code, a "house number + street word" key, and the last address component (region)
 
-   The union is then pruned by absolute and relative similarity and capped per S1. The cost is O(N·k) with chunked sparse matmuls. At billions of records the same vectors go into an ANN index (FAISS/HNSW) per country block.
-3. **Features** (`er/features.py`): RapidFuzz ratio, token_set, token_sort, partial, Jaro-Winkler and Levenshtein on names and addresses; TF-IDF cosines; alias best-match; acronym match; postal equal/different/missing; house-number match; and *competition features* (how far this pair is below the best candidate for the same S1 and for the same S2/S3 record). The country value itself is never used as a feature, only whether the two records agree on it.
+   None of these are country-specific code paths, so the unseen France set goes through the same code.
+2. **Blocking** (`er/blocking.py`) is built to scale:
+   * **Retrieval** makes a wide pool of plausible pairs (about 18 per S1). Each record's sparse TF-IDF vector is reduced with TruncatedSVD (fitted on a sample) to a 128-d dense vector. A FAISS HNSW index per country is queried both ways: S1 → S2/S3 (top 10) and S2/S3 → S1 (top 3). Source 1 is deduplicated, so each S2/S3 record belongs to at most one S1, and the reverse query recovers S1 entities with many duplicates. Exact-key hash joins run alongside it with a bucket-size cap.
+   * **Selection** computes exact sparse cosines on the pool. A pair is kept if it is in the top `k_left` for its S1, the top `k_right` for its S2/S3 record, or the top `k_name` by name. It must pass similarity floors, and each S1 is capped. Pairs that are some record's top choice are kept first when the cap applies.
+   * Cost is O(N log N). At billions of records, FAISS indexes shard per country or region and the key joins become map-reduce group-bys.
+3. **Features** (`er/features.py`, computed in chunks):
+   * RapidFuzz name and address similarities; TF-IDF cosines
+   * alias (DBA) and acronym matches
+   * whether postal code, street key and region are equal, different or missing
+   * house-number overlap
+   * *competition features*: how far this pair is below the best rival for the same S1 and for the same S2/S3 record
+
+   The country value itself is never a feature, only whether the two records agree on it.
 4. **Model** (`er/model.py`): LightGBM binary classifier. Out-of-fold predictions come from GroupKFold grouped by S1 entity.
-5. **Decision rule**: grid-searched directly on macro F0.5 over the OOF predictions (threshold, exclusive assignment, relative-to-best). Recall counts true links that blocking missed, so the score is honest.
+5. **Decision rule**: grid-searched directly on macro F0.5 over the OOF predictions. Recall counts true links that blocking missed, so the reported score is honest.
 
 ## Usage
 
@@ -35,9 +53,14 @@ S1, S2, S3 ──► normalise ──► BLOCKING (TF-IDF kNN, both directions, 
 pip install -r requirements.txt
 # data goes in dataset/train/*.tsv and dataset/test/*.tsv
 
-python tune_blocking.py --data dataset --min_recall 0.98   # choose the smallest candidate config
-python train.py   --data dataset --k_left 3 --k_right 1 --k_name 1   # prints OOF F0.5, saves artifacts/
-python predict.py --data dataset                            # writes output/*.tsv and validates them
+# 1) choose the smallest candidate set that keeps recall (prints recall / candidates-per-S1 / oracle F0.5)
+python tune_blocking.py --data dataset --min_recall 0.97
+
+# 2) train + tune the decision rule (pass the chosen selection flags; --sample_s1 speeds up big data)
+python train.py --data dataset --k_left 2 --k_right 1 --k_name 0 --max_per_s1 5 --sample_s1 300000 --folds 3
+
+# 3) test predictions -> output/matching_results.tsv + output/candidate_pairs.tsv (validated)
+python predict.py --data dataset
 ```
 
 `train.py` prints the blocking report (pair recall, candidates per S1, reduction ratio, oracle F0.5) and the OOF macro F0.5 per country. `predict.py` runs `validate_submission.py`, which checks every submission rule: one row per S1, only existing S2/S3 ids, no duplicates, matches ⊆ candidates.
@@ -50,4 +73,4 @@ python train.py --data synthetic && python predict.py --data synthetic
 ```
 
 ## Licences
-Everything is permissive: LightGBM (MIT), scikit-learn (BSD-3), RapidFuzz (MIT), pandas/numpy/scipy (BSD). There is no model over 8B parameters.
+Everything is permissive: LightGBM (MIT), FAISS (MIT), scikit-learn (BSD-3), RapidFuzz (MIT), pandas/numpy/scipy (BSD). There is no model over 8B parameters.

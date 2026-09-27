@@ -1,7 +1,11 @@
-__pycache__/
 *.pyc
+__pycache__/
+artifacts/
+big/
+big_art/
+big_out/
+big_train.log
+blocking_sweep.tsv
 dataset/
 output/
-artifacts/
 synthetic/
-blocking_sweep.tsv

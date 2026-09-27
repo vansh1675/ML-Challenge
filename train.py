@@ -22,6 +22,10 @@ def main():
     ap.add_argument("--artifacts", default="artifacts")
     ap.add_argument("--folds", type=int, default=5)
     ap.add_argument("--rounds", type=int, default=NUM_ROUNDS)
+    ap.add_argument("--sample_s1", type=int, default=0,
+                    help="train/tune on the pairs of this many random S1 entities (0 = all). "
+                         "Blocking + features still run on the full data so rival/competition "
+                         "features look exactly like at test time.")
     for k, v in BlockingConfig().to_dict().items():
         ap.add_argument(f"--{k}", type=type(v), default=v)
     args = ap.parse_args()
@@ -43,19 +47,36 @@ def main():
     rep = blocking_report(to_sets(left, right, li, ri), truth, ids, len(right))
     print("blocking report:", json.dumps({k: round(v, 4) for k, v in rep.items()}))
 
+    if args.sample_s1 and args.sample_s1 < len(left):
+        rng = np.random.default_rng(0)
+        chosen = np.zeros(len(left), bool)
+        chosen[rng.choice(len(left), args.sample_s1, replace=False)] = True
+        m = chosen[li]
+        X, y, li, ri = X[m].reset_index(drop=True), y[m], li[m], ri[m]
+        # re-index the chosen S1 entities 0..n-1 so the metric averages over them only
+        remap = -np.ones(len(left), np.int64)
+        remap[chosen] = np.arange(chosen.sum())
+        li_eval, n_true_eval = remap[li], n_true[chosen]
+        ids_eval = [i for i, c in zip(ids, chosen) if c]
+        print(f"training on {chosen.sum():,} sampled S1 entities / {len(y):,} pairs")
+    else:
+        li_eval, n_true_eval, ids_eval = li, n_true, ids
+
     print("out-of-fold training ...")
     oof = oof_predict(X, y, groups=li, n_folds=args.folds, rounds=args.rounds)
-    score, dec = tune_decision(li, ri, oof, y, n_true)
+    score, dec = tune_decision(li_eval, ri, oof, y, n_true_eval)
     print(f"OOF macro F0.5 = {score:.4f} with {dec}")
 
     # sanity: recompute with the reference (set-based) metric
     keep = decide(li, ri, oof, **dec)
-    ref = macro_f05(to_sets(left, right, li, ri, keep), truth, ids)
+    pred = to_sets(left, right, li, ri, keep)
+    ref = macro_f05(pred, truth, ids_eval)
     print(f"OOF macro F0.5 (reference implementation) = {ref:.4f}")
+    country = dict(zip(ids, left["country_n"]))
     for c in sorted(set(left["country_n"])):
-        sub = [i for i, cc in zip(ids, left["country_n"]) if cc == c]
-        print(f"  country={c or '<empty>'}: {macro_f05(to_sets(left, right, li, ri, keep), truth, sub):.4f} "
-              f"({len(sub):,} S1)")
+        sub = [i for i in ids_eval if country[i] == c]
+        if sub:
+            print(f"  country={c or '<empty>'}: {macro_f05(pred, truth, sub):.4f} ({len(sub):,} S1)")
 
     print("fitting final model on all training pairs ...")
     booster = train_booster(X, y, args.rounds)
